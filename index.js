@@ -1,27 +1,26 @@
+
 (function() {
     'use strict';
 
     const extensionName = "auto-retry";
     
-    // 默认设置
-    const defaultSettings = {
+    let settings = {
         enabled: true,
         maxRetries: 1,
         retryDelay: 1000
     };
 
-    let settings = Object.assign({}, defaultSettings);
-    let isRetrying = false;
-    let retryAttempts = 0;
+    let retryCount = 0;
+    let lastAction = null; // 'send' or 'regenerate'
 
     // 加载设置
     function loadSettings() {
-        const savedSettings = localStorage.getItem(`${extensionName}_settings`);
-        if (savedSettings) {
+        const saved = localStorage.getItem(`${extensionName}_settings`);
+        if (saved) {
             try {
-                settings = Object.assign({}, defaultSettings, JSON.parse(savedSettings));
+                settings = JSON.parse(saved);
             } catch (e) {
-                console.error('[Auto Retry] Failed to load settings:', e);
+                console.error('[Auto Retry] Load error:', e);
             }
         }
         updateUI();
@@ -30,7 +29,6 @@
     // 保存设置
     function saveSettings() {
         localStorage.setItem(`${extensionName}_settings`, JSON.stringify(settings));
-        console.log('[Auto Retry] Settings saved:', settings);
     }
 
     // 更新UI
@@ -40,92 +38,94 @@
         $('#auto_retry_delay').val(settings.retryDelay);
     }
 
-    // 拦截发送按钮
-    function interceptSendButton() {
-        const originalSend = $('#send_but').off('click');
-        
-        $('#send_but').on('click', function(e) {
-            if (!settings.enabled) {
-                return;
-            }
-            
-            console.log('[Auto Retry] Send button clicked');
-            retryAttempts = 0;
-            isRetrying = false;
+    // 记录用户操作
+    function trackUserAction() {
+        // 监听发送按钮
+        $(document).on('click', '#send_but', function() {
+            lastAction = 'send';
+            retryCount = 0;
+            console.log('[Auto Retry] User clicked send');
         });
-    }
 
-    // 拦截重新生成按钮
-    function interceptRegenerateButton() {
+        // 监听重新生成按钮
         $(document).on('click', '#option_regenerate', function() {
-            if (!settings.enabled) {
-                return;
-            }
+            lastAction = 'regenerate';
+            retryCount = 0;
+            console.log('[Auto Retry] User clicked regenerate');
+        });
+    }
+
+    // 监听网络错误
+    function setupErrorMonitoring() {
+        // 监听所有AJAX错误
+        $(document).ajaxError(function(event, jqXHR, ajaxSettings, thrownError) {
+            if (!settings.enabled) return;
             
-            console.log('[Auto Retry] Regenerate button clicked');
-            retryAttempts = 0;
-            isRetrying = false;
-        });
-    }
-
-    // 监听AJAX错误
-    function monitorAjaxErrors() {
-        $(document).ajaxError(function(event, jqxhr, ajaxSettings, thrownError) {
-            if (!settings.enabled || isRetrying) {
+            // 只处理生成相关的请求
+            const url = ajaxSettings.url || '';
+            if (!url.includes('/generate') && !url.includes('/api/')) {
                 return;
             }
 
-            // 检查是否是生成相关的API调用
-            if (ajaxSettings.url && (
-                ajaxSettings.url.includes('/generate') || 
-                ajaxSettings.url.includes('/api/backends')
-            )) {
-                console.log('[Auto Retry] Generation request failed:', thrownError);
-                handleRetry();
+            console.log('[Auto Retry] Request failed:', url, thrownError);
+            
+            // 检查是否应该重试
+            if (lastAction && retryCount < settings.maxRetries) {
+                retryCount++;
+                console.log(`[Auto Retry] Retrying ${retryCount}/${settings.maxRetries}...`);
+                
+                toastr.info(`正在重试 ${retryCount}/${settings.maxRetries}...`, 'Auto Retry');
+                
+                setTimeout(function() {
+                    performRetry();
+                }, settings.retryDelay);
+            } else if (retryCount >= settings.maxRetries) {
+                console.log('[Auto Retry] Max retries reached');
+                toastr.error(`已重试 ${settings.maxRetries} 次仍失败`, 'Auto Retry');
+                retryCount = 0;
+                lastAction = null;
+            }
+        });
+
+        // 监听AJAX成功（重置状态）
+        $(document).ajaxSuccess(function(event, jqXHR, ajaxSettings) {
+            const url = ajaxSettings.url || '';
+            if (url.includes('/generate') || url.includes('/api/')) {
+                if (retryCount > 0) {
+                    console.log('[Auto Retry] Success after retry');
+                    toastr.success(`重试成功！`, 'Auto Retry');
+                }
+                retryCount = 0;
+                lastAction = null;
             }
         });
     }
 
-    // 处理重试
-    function handleRetry() {
-        if (retryAttempts >= settings.maxRetries) {
-            console.log('[Auto Retry] Max retries reached');
-            toastr.error(`请求失败，已重试 ${settings.maxRetries} 次`, 'Auto Retry');
-            retryAttempts = 0;
-            isRetrying = false;
-            return;
-        }
-
-        retryAttempts++;
-        isRetrying = true;
-
-        console.log(`[Auto Retry] Attempting retry ${retryAttempts}/${settings.maxRetries}`);
-        toastr.info(`正在重试 (${retryAttempts}/${settings.maxRetries})...`, 'Auto Retry');
-
-        setTimeout(function() {
-            try {
-                // 尝试点击发送按钮
+    // 执行重试
+    function performRetry() {
+        try {
+            if (lastAction === 'send') {
+                console.log('[Auto Retry] Retrying send...');
                 const sendBtn = $('#send_but');
-                const regenBtn = $('#option_regenerate');
-
-                if (regenBtn.is(':visible') && !regenBtn.prop('disabled')) {
-                    console.log('[Auto Retry] Triggering regenerate');
-                    regenBtn.click();
-                } else if (!sendBtn.prop('disabled')) {
-                    console.log('[Auto Retry] Triggering send');
-                    sendBtn.click();
+                if (sendBtn.length && !sendBtn.prop('disabled')) {
+                    sendBtn.trigger('click');
                 }
-
-                isRetrying = false;
-            } catch (error) {
-                console.error('[Auto Retry] Retry failed:', error);
-                isRetrying = false;
+            } else if (lastAction === 'regenerate') {
+                console.log('[Auto Retry] Retrying regenerate...');
+                const regenBtn = $('#option_regenerate');
+                if (regenBtn.length && regenBtn.is(':visible') && !regenBtn.prop('disabled')) {
+                    regenBtn.trigger('click');
+                }
             }
-        }, settings.retryDelay);
+        } catch (error) {
+            console.error('[Auto Retry] Retry error:', error);
+            retryCount = 0;
+            lastAction = null;
+        }
     }
 
-    // 创建设置UI
-    function createSettingsUI() {
+    // 创建UI
+    function createUI() {
         const html = `
             <div class="auto-retry-settings">
                 <div class="inline-drawer">
@@ -138,18 +138,18 @@
                             <input id="auto_retry_enabled" type="checkbox" />
                             <span>启用自动重试</span>
                         </label>
-                        <br>
+                        <br><br>
                         <label for="auto_retry_max">
                             <small>最大重试次数：</small>
                         </label>
-                        <input id="auto_retry_max" class="text_pole" type="number" min="1" max="5" value="1" />
-                        <br>
+                        <input id="auto_retry_max" class="text_pole" type="number" min="1" max="5" value="1" style="width: 80px;" />
+                        <br><br>
                         <label for="auto_retry_delay">
                             <small>重试延迟(毫秒)：</small>
                         </label>
-                        <input id="auto_retry_delay" class="text_pole" type="number" min="500" max="10000" step="500" value="1000" />
-                        <br>
-                        <small class="notes">当发送或重新生成失败时，会自动重试指定次数</small>
+                        <input id="auto_retry_delay" class="text_pole" type="number" min="500" max="10000" step="500" value="1000" style="width: 80px;" />
+                        <br><br>
+                        <small class="notes">当发送或重新生成失败时自动重试</small>
                     </div>
                 </div>
             </div>
@@ -161,15 +161,14 @@
         $('#auto_retry_enabled').on('change', function() {
             settings.enabled = $(this).prop('checked');
             saveSettings();
-            console.log('[Auto Retry] Enabled:', settings.enabled);
         });
 
-        $('#auto_retry_max').on('input change', function() {
+        $('#auto_retry_max').on('change', function() {
             settings.maxRetries = parseInt($(this).val()) || 1;
             saveSettings();
         });
 
-        $('#auto_retry_delay').on('input change', function() {
+        $('#auto_retry_delay').on('change', function() {
             settings.retryDelay = parseInt($(this).val()) || 1000;
             saveSettings();
         });
@@ -177,22 +176,18 @@
 
     // 初始化
     jQuery(function() {
-        console.log('[Auto Retry] Plugin loading...');
+        console.log('[Auto Retry] Initializing...');
         
-        // 等待一下确保DOM加载完成
         setTimeout(function() {
             try {
-                createSettingsUI();
+                createUI();
                 loadSettings();
-                interceptSendButton();
-                interceptRegenerateButton();
-                monitorAjaxErrors();
+                trackUserAction();
+                setupErrorMonitoring();
                 
-                console.log('[Auto Retry] Plugin loaded successfully');
-                toastr.success('自动重试插件已加载', 'Auto Retry', { timeOut: 2000 });
+                console.log('[Auto Retry] Loaded successfully');
             } catch (error) {
-                console.error('[Auto Retry] Failed to initialize:', error);
-                toastr.error('自动重试插件加载失败，请查看控制台', 'Auto Retry');
+                console.error('[Auto Retry] Init error:', error);
             }
         }, 1000);
     });
